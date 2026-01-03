@@ -31,7 +31,6 @@
 /* This marks the start of a packed structure section. */
 #include <packed_section_start.h>
 
-
 #define ICMP_TYPE_ECHO_REQUEST	8	/* ICMP type echo request */
 #define ICMP_TYPE_ECHO_REPLY		0	/* ICMP type echo reply */
 
@@ -62,7 +61,7 @@
 BWL_PRE_PACKED_STRUCT struct icmp6_opt {
 	uint8	type;		/* Option identifier */
 	uint8	length;		/* Lenth including type and length */
-	uint8	data[0];	/* Variable length data */
+	uint8	data[];	/* Variable length data */
 } BWL_POST_PACKED_STRUCT;
 
 #define	ICMP6_OPT_TYPE_SRC_LINK_LAYER	1

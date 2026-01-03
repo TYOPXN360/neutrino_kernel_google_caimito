@@ -72,7 +72,7 @@
 #define LAST_ENTRY		74
 #define EEPROM_DELTA_CYCLE	10
 #define CYCLE_LSB_UNIT		100			/* LSB: 1% */
-#define HIST_MIGRATION_FLAG	(BIT(7) | BIT(6))	/* in timerh */
+#define HIST_MIGRATION_FLAG	0xF0			/* in timerh */
 /* if history gaps < threshold, will NOT trigger */
 #define RECOVER_TRIGGER_THR	5
 
@@ -176,9 +176,6 @@ struct max1720x_chip {
 	u16 eeprom_cycle;
 	u16 designcap;
 
-	/* for cycle count recovery */
-	u16 recover_cycle_reg;
-
 	bool init_complete;
 	bool resume_complete;
 	u16 health_status;
@@ -261,6 +258,8 @@ struct max1720x_chip {
 
 	/* information for PROP_NEED_CHARGE_TO_FULL */
 	struct maxfg_bypss_charglimt bypass_chargelimit;
+
+	bool present;
 };
 
 #define MAX1720_EMPTY_VOLTAGE(profile, temp, cycle) \
@@ -1016,7 +1015,7 @@ static ssize_t fix_cycle_count_store(struct device *dev,
 	int ret;
 
 	mutex_lock(&chip->model_lock);
-	if (buf[0] == '1' && !chip->por && !chip->history_ok) {
+	if (buf[0] == '1' && chip->cycle_reg_ok && !chip->history_ok) {
 		ret = max1720x_check_history(chip, true);
 		dev_info(chip->dev, "%s: fix cycle count (ret=%d)\n", __func__, ret);
 	}
@@ -1490,10 +1489,10 @@ static inline bool max1720x_history_migrated(struct maxfg_eeprom_history *hist)
 	if (max1720x_history_empty(hist))
 		return false;
 
-	return (hist->timerh & HIST_MIGRATION_FLAG) == HIST_MIGRATION_FLAG;
+	return hist->timerh == HIST_MIGRATION_FLAG;
 }
 
-/* return true if 2 entries are identical except HIST_MIGRATION_FLAG in timerh */
+/* return true if 2 entries are identical and HIST_MIGRATION_FLAG in timerh */
 static inline bool max1720x_compare_migrated_entry(struct maxfg_eeprom_history *hist_migrated,
 					    struct maxfg_eeprom_history *hist_misplaced)
 {
@@ -1502,7 +1501,7 @@ static inline bool max1720x_compare_migrated_entry(struct maxfg_eeprom_history *
 
 	if (hist_migrated->tempco != hist_misplaced->tempco ||
 	    hist_migrated->rcomp0 != hist_misplaced->rcomp0 ||
-	    hist_migrated->timerh != (hist_misplaced->timerh | HIST_MIGRATION_FLAG) ||
+	    hist_migrated->timerh != HIST_MIGRATION_FLAG ||
 	    hist_migrated->fullcapnom != hist_misplaced->fullcapnom ||
 	    hist_migrated->fullcaprep != hist_misplaced->fullcaprep ||
 	    hist_migrated->mixsoc != hist_misplaced->mixsoc ||
@@ -1624,9 +1623,12 @@ static int max1720x_migrate_history(struct max1720x_chip *chip, int *entry_low, 
 	} while (true);
 
 	/* set migration flag for identification */
-	hist_high.timerh |= HIST_MIGRATION_FLAG;
+	hist_high.timerh = HIST_MIGRATION_FLAG;
 	/* repeatedly fill entries before dst_entry if migrating last entry */
 	do {
+		if (*entry_low > dst_entry)
+			break;
+
 		ret = max1720x_write_history(hist_high, *entry_low);
 		gbms_logbuffer_devlog(chip->ce_log, chip->dev, LOGLEVEL_INFO, 0, LOGLEVEL_INFO,
 				      "migrate history entry %d to %d (ret=%d)",
@@ -1667,16 +1669,14 @@ static int max1720x_fix_reg_eeprom_cycles(struct max1720x_chip *chip, int est_cc
 		ret = REGMAP_WRITE_VERIFY(&chip->regmap, MAX1720X_CYCLES, reg_cycle);
 	} while (ret < 0 && --retry);
 
-	if (ret < 0) {
-		chip->recover_cycle_reg = est_cc;
+	if (ret < 0)
 		return FIX_CC_UPDATE_CYCLES_FAIL;
-	}
 
 	chip->eeprom_cycle = eeprom_cycle;
 	chip->cycle_count = est_cc;
 	chip->model_next_update = -1;
 	chip->cycle_count_offset = est_cc >= MAXIM_CYCLE_COUNT_RESET ? MAXIM_CYCLE_COUNT_RESET : 0;
-	chip->recover_cycle_reg = 0;
+	power_supply_changed(chip->psy);
 
 	return ret >= 0 ? 0 : ret;
 }
@@ -1689,16 +1689,23 @@ static int max1720x_recover_history(struct max1720x_chip *chip, int *first_empty
 	const int last_misplaced = chip->cycle_count / EEPROM_DELTA_CYCLE < LAST_ENTRY
 				   ? chip->cycle_count / EEPROM_DELTA_CYCLE
 				   : LAST_ENTRY;
+	const int target_entry = est_cc / EEPROM_DELTA_CYCLE - 1;
 	int ret;
 
 	/* Migrate history from first_misplaced entry to first_empty entry */
 	for (*first_migrated = *first_empty; *first_misplaced <= last_misplaced;
 	     ++*first_empty, ++*first_misplaced) {
 		ret = max1720x_migrate_history(chip, first_empty, first_misplaced,
-					       est_cc / EEPROM_DELTA_CYCLE - 1);
+					       target_entry);
 		if (ret < 0)
 			return FIX_CC_MIGRATE_HIST_FAIL;
 
+		/* previous history recovery done, needs to recover FG register and EEPROM */
+		if (*first_empty > target_entry) {
+			*first_migrated = 0;
+			*last_migrated = 0;
+			break;
+		}
 		*last_migrated = *first_empty;
 	}
 	chip->history_ok = true;
@@ -1727,7 +1734,8 @@ static int max1720x_check_history(struct max1720x_chip *chip, bool fix)
 		return ret;
 
 	/* check if last recovery was not complete */
-	if (last_migrated == first_empty - 1) {
+	if (last_migrated != 0 && last_migrated == first_empty - 1 &&
+	    last_cc / EEPROM_DELTA_CYCLE > last_migrated) {
 		recovering = true;
 		num_migrated = last_migrated - first_migrated + 1;
 	}
@@ -1765,6 +1773,7 @@ static int max1720x_check_history(struct max1720x_chip *chip, bool fix)
 	 */
 	if (recovering && first_misplaced == LAST_ENTRY)
 		est_cc = (first_empty + num_overflow - num_migrated) * EEPROM_DELTA_CYCLE;
+
 	gbms_logbuffer_devlog(chip->ce_log, chip->dev,
 			      LOGLEVEL_INFO, 0, LOGLEVEL_INFO,
 			      "History: fe=%d, fm=%d, migrated=%d-%d, cc=%d->%d",
@@ -1818,21 +1827,8 @@ static int max1720x_check_history(struct max1720x_chip *chip, bool fix)
 history_verified:
 	chip->history_ok = true;
 
-	/* handle the case that history has been recovered, but reg and eeprom hasn't */
-	if (recovering) {
-		est_cc = (last_migrated + 1) * EEPROM_DELTA_CYCLE;
-		ret = max1720x_fix_reg_eeprom_cycles(chip, est_cc);
-		gbms_logbuffer_devlog(chip->monitor_log, chip->dev,
-				      LOGLEVEL_INFO, 0, LOGLEVEL_INFO,
-				      "0x%04X %X %X %X %X %X %X %X %X %X %llX", MONITOR_TAG_HV,
-				      MAX1720X_RECOVERY_LOG_TRIGGER, first_empty, first_misplaced,
-				      first_migrated, last_migrated, last_cc, chip->cycle_count,
-				      chip->eeprom_cycle, ret, ktime_get_real_seconds());
-		return ret;
-	}
-
 	/* log if cycle count has been fixed */
-	if (last_migrated)
+	if (last_migrated && last_cc / EEPROM_DELTA_CYCLE > last_migrated)
 		gbms_logbuffer_devlog(chip->monitor_log, chip->dev,
 				      LOGLEVEL_INFO, 0, LOGLEVEL_INFO,
 				      "0x%04X %X %X %X %X %X %X %X %X %X %llX", MONITOR_TAG_HV,
@@ -2016,9 +2012,6 @@ static int max1720x_update_cycle_count(struct max1720x_chip *chip)
 	 */
 	if (chip->por)
 		return -ECANCELED;
-
-	if (chip->recover_cycle_reg && chip->gauge_type == MAX_M5_GAUGE_TYPE)
-		return max1720x_check_history(chip, true);
 
 	/* if cycle reg hasn't been restored/recovered, finish it first */
 	if (!chip->cycle_reg_ok && chip->gauge_type == MAX_M5_GAUGE_TYPE &&
@@ -2431,14 +2424,14 @@ static int max1720x_monitor_log_learning_extend(char* buf, int len, struct maxfg
 	return rc;
 }
 
-static int max1720x_monitor_log_learning(struct max1720x_chip *chip, bool force)
+static int max1720x_monitor_log_learning(struct max1720x_chip *chip, enum fg_log_event event)
 {
 	bool log_it, seed = !chip->cb_lh.latest_entry;
 	char* buf;
 	int ret;
 
 	/* do noting if no changes on dpacc/dqacc or relaxation */
-	log_it = force || seed ||
+	log_it = event != FG_LOG_RELAX || seed ||
 		 maxfg_ce_relaxed(&chip->regmap, MAX_M5_FSTAT_RELDT | MAX_M5_FSTAT_RELDT2,
 				  (u16*)chip->cb_lh.latest_entry);
 	if (!log_it)
@@ -2478,7 +2471,7 @@ static int max1720x_monitor_log_learning(struct max1720x_chip *chip, bool force)
 
 		gbms_logbuffer_devlog(chip->monitor_log, chip->dev,
 				      LOGLEVEL_INFO, 0, LOGLEVEL_INFO,
-				      "0x%04X %s", MONITOR_TAG_LH, buf);
+				      "0x%04X %s EVT:%d", MONITOR_TAG_LH, buf, event);
 	}
 
 	kfree(buf);
@@ -2529,6 +2522,67 @@ static void max1720x_check_por(struct max1720x_chip *chip)
 	}
 }
 
+static int max1720x_get_fade_rate(struct device *dev, int bhi_fcn_count, int *fade_rate,
+				  int designcap)
+{
+	struct max1720x_eeprom_history hist;
+	const int hist_dummy = 2; /* there are 2 dummy pages ahead */
+	int count, hist_idx, i, ret, ratio, fc_sum = 0, max = 0, min = 0;
+
+	if (!designcap)
+		return -EINVAL;
+
+	count = gbms_storage_read_data(GBMS_TAG_SCHI, NULL, 0, 0);
+
+	if (count < 0) {
+		dev_err(dev, "failed to get history count (%d)\n", count);
+		return -EIO;
+	}
+
+	/* no fade for new battery */
+	if (count - hist_dummy < bhi_fcn_count)
+		return 0;
+
+	if (count - hist_dummy >= bhi_fcn_count + BHI_CAP_FILTER_VALUE_COUNT)
+		bhi_fcn_count += BHI_CAP_FILTER_VALUE_COUNT;
+
+	/* last page */
+	if (count == MAX1720X_N_OF_HISTORY_PAGES)
+		bhi_fcn_count = 1;
+
+	for (i = bhi_fcn_count, hist_idx = count - 1; i; i--, hist_idx--) {
+		ret = gbms_storage_read_data(GBMS_TAG_SCHI, &hist, sizeof(hist), hist_idx);
+		dev_dbg(dev, "%s: idx=%d hist.fcn=%d (%x) hist.fcr=%d (%x) designcap=%d ret=%d\n",
+			     __func__, hist_idx, hist.fullcapnom, hist.fullcapnom,
+			     hist.fullcaprep, hist.fullcaprep, designcap, ret);
+
+		if (ret != sizeof(hist))
+			return -EINVAL;
+
+		fc_sum += hist.fullcapnom;
+
+		if (min == 0 || hist.fullcapnom < min)
+			min = hist.fullcapnom;
+
+		if (max == 0 || hist.fullcapnom > max)
+			max = hist.fullcapnom;
+	}
+
+	if (bhi_fcn_count > BHI_CAP_FILTER_VALUE_COUNT) {
+		/* filter max/min values */
+		fc_sum = fc_sum - min - max;
+		bhi_fcn_count -= BHI_CAP_FILTER_VALUE_COUNT;
+	}
+
+	/* convert from maxfg_eeprom_history to percent */
+	ratio = fc_sum / bhi_fcn_count * 100 / designcap;
+
+	/* allow negative value when capacity larger than design */
+	*fade_rate = 100 - ratio;
+
+	return 0;
+}
+
 static int max1720x_get_property(struct power_supply *psy,
 				 enum power_supply_property psp,
 				 union power_supply_propval *val)
@@ -2567,7 +2621,7 @@ static int max1720x_get_property(struct power_supply *psy,
 			batt_ce_start(&chip->cap_estimate,
 				      chip->cap_estimate.cap_tsettle);
 		/* check for relaxation event and log it */
-		max1720x_monitor_log_learning(chip, false);
+		max1720x_monitor_log_learning(chip, FG_LOG_RELAX);
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
 		val->intval = max1720x_get_battery_soc(chip);
@@ -2636,6 +2690,11 @@ static int max1720x_get_property(struct power_supply *psy,
 
 			/* BST is 0 when the battery is present */
 			val->intval = !(data & MAX1720X_STATUS_BST);
+			if (chip->present != val->intval)
+				dev_warn(chip->dev, "present update:%d->%d (%#x)",
+					 chip->present, val->intval, data);
+			chip->present = val->intval;
+
 			if (!val->intval)
 				break;
 
@@ -2812,7 +2871,7 @@ static int max1720x_monitor_log_data(struct max1720x_chip *chip, bool force_log)
 {
 	int ret, charge_counter = -1;
 	u16 repsoc, data;
-	char buf[256] = { 0 };;
+	char buf[256] = { 0 };
 
 	ret = REGMAP_READ(&chip->regmap, MAX1720X_REPSOC, &data);
 	if (ret < 0)
@@ -2833,6 +2892,12 @@ static int max1720x_monitor_log_data(struct max1720x_chip *chip, bool force_log)
 	gbms_logbuffer_devlog(chip->monitor_log, chip->dev, LOGLEVEL_INFO, 0, LOGLEVEL_INFO,
 			     "0x%04X %02X:%04X %s CC:%d", MONITOR_TAG_RM, MAX1720X_REPSOC, data,
 			     buf, charge_counter);
+
+	/* Log learning entry when reaching 100% and each % drop for SoC < 10% */
+	if (chip->pre_repsoc > 0 && chip->pre_repsoc < 100 && repsoc == 100)
+		max1720x_monitor_log_learning(chip, FG_LOG_REACHING_100);
+	else if (chip->pre_repsoc <= 10 && repsoc < chip->pre_repsoc)
+		max1720x_monitor_log_learning(chip, FG_LOG_FALL_BELOW_10);
 
 	chip->pre_repsoc = repsoc;
 
@@ -2858,12 +2923,13 @@ static int max1720x_property_is_writeable(struct power_supply *psy,
 static int max1720x_aafv_update(struct max1720x_chip *chip)
 {
 	const struct aafv_fg_config *cfg;
+	struct logbuffer *mon = chip->ce_log;
 	int ret, idx;
 
-	ret = maxfg_aafv_apply(&chip->regmap, chip->aafv,
+	ret = maxfg_aafv_apply(mon, chip->dev, &chip->regmap, chip->aafv,
 			       chip->aafv_cfgs, chip->aafv_config_limits,
 			       MAX_M5_MISCCFG_OOPSFILTER_CLEAR, MAX_M5_MISCCFG_OOPSFILTER_SHIFT,
-			       &idx);
+			       &chip->aafv_modified_fus, &idx);
 	if (ret) {
 		dev_err(chip->dev, "failed to maxfg_aafv_apply (%d)\n", ret);
 		return ret;
@@ -2872,13 +2938,12 @@ static int max1720x_aafv_update(struct max1720x_chip *chip)
 	if (chip->aafv_cur_idx != idx) {
 		cfg = &chip->aafv_cfgs[idx];
 		chip->aafv_cur_idx = idx;
-		chip->aafv_modified_fus = true;
 
-		gbms_logbuffer_devlog(chip->monitor_log, chip->dev, LOGLEVEL_INFO, 0,
-				       LOGLEVEL_INFO,
-				      "aafv_fullsoc_update with %d %d %d %d",
-				      chip->cycle_count, cfg->fullsoc, cfg->voffset,
-				      cfg->fus);
+		gbms_logbuffer_devlog(mon, chip->dev, LOGLEVEL_INFO, 0, LOGLEVEL_INFO,
+				      "%s with cycle_count:%d fullsoc:%d%% voffset:%dmV fus:%#x(%s) ichgterm:%duA",
+				      __func__, chip->cycle_count, cfg->fullsoc, cfg->voffset,
+				      cfg->fus, chip->aafv_modified_fus ? "set" : "unset",
+				      reg_to_micro_amp(cfg->ichgterm, chip->RSense));
 	}
 
 	return ret;
@@ -2935,8 +3000,12 @@ static int max1720x_gbms_get_property(struct power_supply *psy,
 		val->prop.intval = batt_ce_full_estimate(&chip->cap_estimate);
 		break;
 	case GBMS_PROP_CAPACITY_FADE_RATE:
-	case GBMS_PROP_CAPACITY_FADE_RATE_FCR:
-		err = maxfg_get_fade_rate(chip->dev, chip->bhi_fcn_count, &val->prop.intval, psp);
+		if (chip->gauge_type == MAX_M5_GAUGE_TYPE)
+			err = maxfg_get_fade_rate(chip->dev, chip->bhi_fcn_count,
+						  &val->prop.intval);
+		if (chip->gauge_type == MAX1720X_GAUGE_TYPE)
+			err = max1720x_get_fade_rate(chip->dev, chip->bhi_fcn_count,
+						     &val->prop.intval, chip->designcap);
 		break;
 	case GBMS_PROP_BATT_ID:
 		val->prop.intval = chip->batt_id;
@@ -2945,14 +3014,18 @@ static int max1720x_gbms_get_property(struct power_supply *psy,
 		if (chip->gauge_type == MAX_M5_GAUGE_TYPE)
 			val->prop.intval = max_m5_recal_state(chip->model_data);
 		break;
-	case GBMS_PROP_AAFV:
+	case GBMS_PROP_AAFV_OFFSET:
 		val->prop.intval = chip->aafv;
 		break;
 	case GBMS_PROP_NEED_CHARGE_TO_FULL:
-		val->prop.intval = maxfg_need_force_fullcharge(&chip->regmap,
+		if (chip->gauge_type != MAX_M5_GAUGE_TYPE)
+			break;
+
+		val->prop.intval = maxfg_need_force_fullcharge(chip->ce_log, chip->dev,
+							       &chip->regmap,
 							       &chip->bypass_chargelimit,
 							       chip->cycle_count) ||
-				   chip->aafv_modified_fus;
+							       chip->aafv_modified_fus;
 		break;
 	default:
 		pr_debug("%s: route to max1720x_get_property, psp:%d\n", __func__, psp);
@@ -3036,17 +3109,21 @@ static int max1720x_gbms_set_property(struct power_supply *psy,
 	case GBMS_PROP_RECAL_FG:
 		max1720x_set_recalibration(chip, val->prop.intval);
 		break;
-	case GBMS_PROP_AAFV:
+	case GBMS_PROP_AAFV_OFFSET:
 		mutex_lock(&chip->model_lock);
 		chip->aafv = val->prop.intval;
 		rc = max1720x_aafv_update(chip);
 		mutex_unlock(&chip->model_lock);
 		break;
 	case GBMS_PROP_NEED_CHARGE_TO_FULL:
-		rc = maxfg_update_bypass_charge_limit(&chip->regmap, &chip->bypass_chargelimit,
-						      chip->cycle_count);
+		rc = maxfg_update_bypass_charge_limit(chip->ce_log, chip->dev,
+						      &chip->regmap, &chip->bypass_chargelimit,
+						      val->prop.intval);
 		if (rc < 0)
 			dev_err(chip->dev, "failed to update bypass charge limit %d\n", rc);
+		break;
+	case GBMS_PROP_FG_EVENT_LOGGING:
+		max1720x_monitor_log_learning(chip, val->prop.intval);
 		break;
 	default:
 		pr_debug("%s: route to max1720x_set_property, psp:%d\n", __func__, psp);
@@ -3065,8 +3142,11 @@ static int max1720x_gbms_property_is_writeable(struct power_supply *psy,
 	switch (psp) {
 	case GBMS_PROP_BATT_CE_CTRL:
 	case GBMS_PROP_HEALTH_ACT_IMPEDANCE:
-	case GBMS_PROP_AAFV:
+	case GBMS_PROP_FG_REG_LOGGING:
+	case GBMS_PROP_RECAL_FG:
+	case GBMS_PROP_AAFV_OFFSET:
 	case GBMS_PROP_NEED_CHARGE_TO_FULL:
+	case GBMS_PROP_FG_EVENT_LOGGING:
 		return 1;
 	default:
 		break;
@@ -3329,7 +3409,7 @@ static irqreturn_t max1720x_fg_irq_thread_fn(int irq, void *obj)
 			if (storm) {
 				pr_debug("Force power_supply_change in storm\n");
 			} else {
-				max1720x_monitor_log_learning(chip, false);
+				max1720x_monitor_log_learning(chip, FG_LOG_RELAX);
 				max1720x_monitor_log_data(chip, false);
 				if (chip->gauge_type == MAX_M5_GAUGE_TYPE)
 					max_m5_check_recal_state(chip->model_data,
@@ -3676,12 +3756,10 @@ static int max17x0x_apply_regval_register(struct max1720x_chip *chip,
 	}
 
 	for (idx = 0; idx < cnt; idx += 2) {
-		if (max1720x_is_reg(chip->dev, regs[idx])) {
-			err = REGMAP_READ(&chip->regmap, regs[idx], &data);
-			if (!err && data != regs[idx + 1])
-				REGMAP_WRITE(&chip->regmap, regs[idx],
-					     regs[idx + 1]);
-		}
+		err = REGMAP_READ(&chip->regmap, regs[idx], &data);
+		if (!err && data != regs[idx + 1])
+			REGMAP_WRITE(&chip->regmap, regs[idx],
+					regs[idx + 1]);
 	}
 register_out:
 	kfree(regs);
@@ -4046,7 +4124,7 @@ static int max1720x_log_learn_set(void *data, u64 val)
 {
 	struct max1720x_chip *chip = (struct max1720x_chip *)data;
 
-	max1720x_monitor_log_learning(chip, true);
+	max1720x_monitor_log_learning(chip, FG_LOG_DEBUG);
 	return 0;
 }
 DEFINE_SIMPLE_ATTRIBUTE(debug_log_learn_fops, NULL, max1720x_log_learn_set, "%llu\n");
@@ -4443,22 +4521,19 @@ static ssize_t registers_dump_show(struct device *dev, struct device_attribute *
 	int ret = 0, offset = 0;
 
 	if (!chip->regmap.regmap) {
-		dev_err(dev, "Failed to read, no regmap\n");
+		dev_err(chip->dev, "Failed to read, no regmap\n");
 		return -EIO;
 	}
 
 	for (reg_address = 0; reg_address <= 0xFF; reg_address++) {
-		if (!max1720x_is_reg(dev, reg_address))
-			continue;
-
 		ret = regmap_read(chip->regmap.regmap, reg_address, &data);
 		if (ret < 0)
 			continue;
 
-		ret = sysfs_emit_at(buf, offset, "%02x: %04x\n", reg_address, data);
-		if (!ret) {
-			dev_err(dev, "[%s]: Not all registers printed. last:%x\n", __func__,
-				reg_address - 1);
+		ret = sysfs_emit_at(buf, offset, "%02x:%x\n", reg_address, data);
+		if (ret < 0 || offset + ret >= PAGE_SIZE - 1) {
+			dev_err(chip->dev, "[%s]: Not all regs printed. last:%x off:%d ret:%d\n",
+				__func__, reg_address - 1, offset, ret);
 			break;
 		}
 		offset += ret;
@@ -4468,23 +4543,20 @@ static ssize_t registers_dump_show(struct device *dev, struct device_attribute *
 		return offset;
 
 	ret = sysfs_emit_at(buf, offset, "\nnvram:\n");
-	if (!ret)
+	if (ret < 0 || offset + ret >= PAGE_SIZE - 1)
 		return offset;
 
 	offset += ret;
 
 	for (reg_address = 0; reg_address <= 0xFF; reg_address++) {
-		if (!max1720x_is_nvram_reg(dev, reg_address))
-			continue;
-
 		ret = regmap_read(chip->regmap_nvram.regmap, reg_address, &data);
 		if (ret < 0)
 			continue;
 
-		ret = sysfs_emit_at(buf, offset, "%02x: %04x\n", reg_address, data);
-		if (!ret) {
-			dev_err(dev, "[%s]: Not all registers printed. last:%x\n", __func__,
-				reg_address - 1);
+		ret = sysfs_emit_at(buf, offset, "%02x:%x\n", reg_address, data);
+		if (ret < 0 || offset + ret >= PAGE_SIZE - 1) {
+			dev_err(chip->dev, "[%s]: Not all regs printed. last:%x off:%d ret:%d\n",
+				__func__, reg_address - 1, offset, ret);
 			break;
 		}
 		offset += ret;
@@ -5419,8 +5491,12 @@ static int max1720x_init_chip(struct max1720x_chip *chip)
 		dev_err(chip->dev, "Cannot init FG model (%d)\n", ret);
 
 	/* loading default aafv values from device tree */
-	ret = maxfg_aafv_init(chip->batt_node, "maxim,fg-aafv", chip->aafv_cfgs,
-			      &chip->aafv_config_limits);
+	if (chip->gauge_type == MAX_M5_GAUGE_TYPE)
+		ret = maxfg_aafv_init(chip->batt_node, "maxim,fg-aafv", chip->aafv_cfgs,
+				      &chip->aafv_config_limits);
+	else
+		ret = maxfg_aafv_init(chip->dev->of_node, "maxim,fg-aafv", chip->aafv_cfgs,
+				      &chip->aafv_config_limits);
 	if (ret < 0)
 		dev_warn(chip->dev, "Cannot load aafv config(%d)\n", ret);
 
@@ -5498,8 +5574,12 @@ static int max1720x_init_chip(struct max1720x_chip *chip)
 	}
 
 	/* MW has its own update flow */
-	if (chip->gauge_type != MAX_M5_GAUGE_TYPE)
+	if (chip->gauge_type != MAX_M5_GAUGE_TYPE) {
 		max1720x_update_cycle_count(chip);
+		ret = REGMAP_READ(&chip->regmap, MAX1720X_DESIGNCAP, &chip->designcap);
+		if (ret < 0)
+			dev_err(chip->dev, "Error reading designcap reg (%d)\n", ret);
+	}
 
 	max1720x_restore_battery_qh_capacity(chip);
 
@@ -5512,6 +5592,7 @@ static int max1720x_init_chip(struct max1720x_chip *chip)
 		fus = misccfg >> MAX_M5_MISCCFG_OOPSFILTER_SHIFT;
 		chip->aafv_modified_fus = (fus == chip->aafv_cfgs[chip->aafv_cur_idx].fus);
 	}
+	dev_info(chip->dev, "aafv_modified_fus: %d\n", chip->aafv_modified_fus);
 
 	return 0;
 }
@@ -5797,7 +5878,7 @@ static int max17x0x_storage_read_data(gbms_tag_t tag, void *buff, size_t size,
 	struct max1720x_chip *chip = (struct max1720x_chip *)ptr;
 
 	switch (tag) {
-	case GBMS_TAG_HIST:
+	case GBMS_TAG_SCHI:
 		/* short reads are invalid */
 		if (size && size != chip->history_page_size * 2)
 			return -EINVAL;
@@ -5827,7 +5908,7 @@ static int max17x0x_storage_iter(int index, gbms_tag_t *tag, void *ptr)
 	if (index >= 0 && index < count) {
 		*tag = keys[index];
 	} else if (chip->history_available && index == count) {
-		*tag = GBMS_TAG_HIST;
+		*tag = GBMS_TAG_SCHI;
 	} else {
 		return -ENOENT;
 	}
@@ -6092,6 +6173,11 @@ static void max1720x_init_work(struct work_struct *work)
 						  init_work.work);
 	int ret = 0;
 
+	/* Init History and Capacity Estimate only when gauge type is known. */
+	ret = max1720x_init_history(chip);
+	if (ret == 0)
+		(void)max1720x_init_history_device(chip);
+
 	if (chip->gauge_type != -1) {
 
 		/* TODO: move to max1720x1 */
@@ -6103,9 +6189,11 @@ static void max1720x_init_work(struct work_struct *work)
 		}
 
 		/* these don't require nvm storage */
-		ret = gbms_storage_register(&max17x0x_prop_dsc, "maxfg", chip);
-		if (ret == -EBUSY)
-			ret = 0;
+		if (chip->gauge_type == MAX_M5_GAUGE_TYPE) {
+			ret = gbms_storage_register(&max17x0x_prop_dsc, "maxfg", chip);
+			if (ret == -EBUSY)
+				ret = 0;
+		}
 
 		if (ret == 0)
 			ret = max1720x_init_chip(chip);
@@ -6115,6 +6203,12 @@ static void max1720x_init_work(struct work_struct *work)
 			return;
 		}
 	}
+
+	/* initialize bypass charge limit after chip and storage are initialized */
+	ret = maxfg_init_bypass_charge_limit(&chip->regmap, chip->dev->of_node,
+					     &chip->bypass_chargelimit);
+	if (ret < 0)
+		dev_err(chip->dev, "error on init bypass charge limit(%d)\n", ret);
 
 	/* serial number might not be stored in the FG */
 	max17x0x_read_serial_number(chip);
@@ -6151,11 +6245,6 @@ static void max1720x_init_work(struct work_struct *work)
 	dev_info(chip->dev, "init_work done\n");
 	if (chip->gauge_type == -1)
 		return;
-
-	/* Init History and Capacity Estimate only when gauge type is known. */
-	ret = max1720x_init_history(chip);
-	if (ret == 0)
-		(void)max1720x_init_history_device(chip);
 
 	ret = batt_ce_load_data(&chip->regmap_nvram, &chip->cap_estimate);
 	if (ret == 0)
@@ -6447,11 +6536,6 @@ static int max1720x_probe(struct i2c_client *client,
 				   &chip->bhi_fcn_count);
 	if (ret < 0)
 		chip->bhi_fcn_count = BHI_CAP_FCN_COUNT;
-
-	ret = maxfg_init_bypass_charge_limit(&chip->regmap, dev->of_node,
-					     &chip->bypass_chargelimit);
-	if (ret < 0)
-		dev_err(dev, "error on init bypass charge limit(%d)\n", ret);
 
 	/* use VFSOC until it can confirm that FG Model is running */
 	reg = maxfg_find_by_tag(&chip->regmap, MAXFG_TAG_vfsoc);
