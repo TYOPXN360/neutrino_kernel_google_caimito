@@ -34,7 +34,7 @@
 #include <linux/mnt_idmapping.h>
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 #include <linux/susfs_def.h>
-#endif
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 
 #include "pnode.h"
 #include "internal.h"
@@ -46,9 +46,8 @@ extern bool susfs_is_boot_completed_triggered __read_mostly;
 static DEFINE_IDA(susfs_ksu_mnt_group_ida);
 static atomic64_t susfs_ksu_mounts = ATOMIC64_INIT(0);
 
-/* used by copy_mnt_ns() */
-#define CL_COPY_MNT_NS BIT(25)
-#endif
+#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 
 /* Maximum number of mounts in a mount namespace */
 static unsigned int sysctl_mount_max __read_mostly = 100000;
@@ -159,14 +158,13 @@ static int mnt_alloc_id(struct mount *mnt)
 static void mnt_free_id(struct mount *mnt)
 {
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-	/* Check if susfs_mnt_id_backup
-	 * is >= DEFAULT_KSU_MNT_ID */
+	// First we have to check if susfs_mnt_id_backup == DEFAULT_KSU_MNT_ID,
+	// if so, no need to free.
 	if (mnt->mnt.susfs_mnt_id_backup == DEFAULT_KSU_MNT_ID) {
 		return;
 	}
 
-	/* Check if susfs_mnt_id_backup
-	 * was set after mnt_id reorder */
+	// Second if susfs_mnt_id_backup was set after mnt_id reorder, free it if so.
 	if (likely(mnt->mnt.susfs_mnt_id_backup)) {
 		ida_free(&mnt_id_ida, mnt->mnt.susfs_mnt_id_backup);
 		return;
@@ -184,7 +182,11 @@ static int mnt_alloc_group_id(struct mount *mnt)
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 	int res;
 
-	/* Custom mnt_group_id may be assigned to ksu mounts before boot completion */
+	/* - At frist susfs_is_boot_completed_triggered is set to false in kernel,
+	 *   and it is still allowed to assign our custom mnt_group_id via susfs_ksu_mnt_group_ida
+	 *   if it is ksu mounts, until susfs_is_boot_completed_triggered is set to true
+	 *   when boot-completed stage is triggered in core_hook.c 
+	 */
 	if (!susfs_is_boot_completed_triggered && mnt->mnt_id >= DEFAULT_KSU_MNT_ID) {
 		res = ida_alloc_min(&susfs_ksu_mnt_group_ida, DEFAULT_KSU_MNT_GROUP_ID, GFP_KERNEL);
 		goto bypass_orig_flow;
@@ -207,8 +209,15 @@ bypass_orig_flow:
 void mnt_release_group_id(struct mount *mnt)
 {
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-	/* Following boot completion sus mnt_group_id will not be freed, umounting
-	 * in global mnt namespace will result in harmless ida_free() errors */
+	/* - when boot-completed stage is triggered in core_hook.c,
+	 *   susfs_is_boot_completed_triggered will be set to true.
+	 * - Please note that if susfs_is_boot_completed_triggered is true, then
+	 *   it no longer checks for the sus mnt_group_id, and the allocated
+	 *   sus mnt_group_id will stay in kernel memory forever, and if user
+	 *   suddenly umounts the sus mount in global mnt namespace, the ida_free()
+	 *   function will throw error to kernel log, but it won't affect the system,
+	 *   so it is fine.
+	 */
 	if (!susfs_is_boot_completed_triggered && mnt->mnt_group_id >= DEFAULT_KSU_MNT_GROUP_ID) {
 		ida_free(&susfs_ksu_mnt_group_ida, mnt->mnt_group_id);
 		mnt->mnt_group_id = 0;
@@ -253,7 +262,7 @@ int mnt_get_count(struct mount *mnt)
 }
 
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-/* A copy of alloc_vfsmnt() that allocates the original mnt_id */
+/* A copy of alloc_vfsmnt() but reuse the original mnt_id to mnt */
 static struct mount *susfs_reuse_sus_vfsmnt(const char *name, int orig_mnt_id)
 {
 	struct mount *mnt = kmem_cache_zalloc(mnt_cache, GFP_KERNEL);
@@ -262,7 +271,7 @@ static struct mount *susfs_reuse_sus_vfsmnt(const char *name, int orig_mnt_id)
 
 		if (name) {
 			mnt->mnt_devname = kstrdup_const(name,
-			                                 GFP_KERNEL_ACCOUNT);
+							 GFP_KERNEL_ACCOUNT);
 			if (!mnt->mnt_devname)
 				goto out_free_cache;
 		}
@@ -277,7 +286,7 @@ static struct mount *susfs_reuse_sus_vfsmnt(const char *name, int orig_mnt_id)
 		mnt->mnt_count = 1;
 		mnt->mnt_writers = 0;
 #endif
-		/* Determine if mnt_id should be freed */
+		// Makes ida_free() easier to determine whether it should free the mnt_id or not
 		mnt->mnt.susfs_mnt_id_backup = DEFAULT_KSU_MNT_ID;
 
 		INIT_HLIST_NODE(&mnt->mnt_hash);
@@ -306,7 +315,7 @@ out_free_cache:
 #endif
 
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-/* A copy of alloc_vfsmnt() that allocates the sus mnt_id */
+/* A copy of alloc_vfsmnt() but allocates the fake mnt_id to mnt */
 static struct mount *susfs_alloc_sus_vfsmnt(const char *name)
 {
 	struct mount *mnt = kmem_cache_zalloc(mnt_cache, GFP_KERNEL);
@@ -315,7 +324,7 @@ static struct mount *susfs_alloc_sus_vfsmnt(const char *name)
 
 		if (name) {
 			mnt->mnt_devname = kstrdup_const(name,
-			                                 GFP_KERNEL_ACCOUNT);
+							 GFP_KERNEL_ACCOUNT);
 			if (!mnt->mnt_devname)
 				goto out_free_cache;
 		}
@@ -330,7 +339,7 @@ static struct mount *susfs_alloc_sus_vfsmnt(const char *name)
 		mnt->mnt_count = 1;
 		mnt->mnt_writers = 0;
 #endif
-		/* Determine if mnt_id should be freed */
+		// Makes ida_free() easier to determine whether it should free the mnt_id or not
 		mnt->mnt.susfs_mnt_id_backup = DEFAULT_KSU_MNT_ID;
 
 		INIT_HLIST_NODE(&mnt->mnt_hash);
@@ -386,7 +395,7 @@ static struct mount *alloc_vfsmnt(const char *name)
 		mnt->mnt_writers = 0;
 #endif
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-		/* Make sure mnt->mnt.susfs_mnt_id_backup is initialized */
+		// Make sure mnt->mnt.susfs_mnt_id_backup is initialized every time.
 		mnt->mnt.susfs_mnt_id_backup = 0;
 #endif
 
@@ -1180,7 +1189,7 @@ struct vfsmount *vfs_create_mount(struct fs_context *fc)
 		return ERR_PTR(-EINVAL);
 
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-	/* Check for KSU process until boot completed */
+	// We keep checking for ksu process only until boot-completed stage is triggered
 	if (!susfs_is_boot_completed_triggered && susfs_is_current_ksu_domain()) {
 		mnt = susfs_alloc_sus_vfsmnt(fc->source ?: "none");
 		atomic64_add(1, &susfs_ksu_mounts);
@@ -1279,26 +1288,26 @@ static struct mount *clone_mnt(struct mount *old, struct dentry *root,
 	int err;
 
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-	/* Don't check for KSU process if boot completed */
+	// - We do not check anymore for ksu process if boot-completed stage is triggered
+	//   just to stop the performance loss
 	if (susfs_is_boot_completed_triggered) {
 		goto skip_checking_for_ksu_proc;
 	}
 
-	/* Check for KSU process */
+	// First we must check for ksu process because of magic mount
 	if (susfs_is_current_ksu_domain()) {
-		/* Reuse old->mnt_id if unsharing */
+		// if it is unsharing, we reuse the old->mnt_id
 		if (flag & CL_COPY_MNT_NS) {
 			mnt = susfs_reuse_sus_vfsmnt(old->mnt_devname, old->mnt_id);
 			goto bypass_orig_flow;
 		}
-		/* Otherwise, assign sus mnt_id */
+		// else we just go assign fake mnt_id
 		mnt = susfs_alloc_sus_vfsmnt(old->mnt_devname);
 		goto bypass_orig_flow;
 	}
 
 skip_checking_for_ksu_proc:
-	/* All other processes where old->mnt_id is >=
-	 * DEFAULT_KSU_MNT_ID receive sus mnt_id */
+	// Lastly for other processes of which old->mnt_id == DEFAULT_KSU_MNT_ID, go assign fake mnt_id
 	if (old->mnt_id == DEFAULT_KSU_MNT_ID) {
 		mnt = susfs_alloc_sus_vfsmnt(old->mnt_devname);
 		goto bypass_orig_flow;
@@ -4969,7 +4978,7 @@ fs_initcall(init_fs_namespace_sysctls);
 #endif /* CONFIG_SYSCTL */
 
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-/* Reorder mnt_id after all sus mounts are umounted */
+/* Reorder the mnt_id after all sus mounts are umounted during ksu_handle_setuid() */
 void susfs_reorder_mnt_id(void) {
 	struct mnt_namespace *mnt_ns = current->nsproxy->mnt_ns;
 	struct mount *mnt;
@@ -4979,7 +4988,7 @@ void susfs_reorder_mnt_id(void) {
 		return;
 	}
 
-	/* Don't reorder mnt_id if there is no KSU mount */
+	// Do not reorder the mnt_id if there is no any ksu mount at all
 	if (atomic64_read(&susfs_ksu_mounts) == 0) {
 		return;
 	}
@@ -4988,7 +4997,7 @@ void susfs_reorder_mnt_id(void) {
 
 	first_mnt_id = list_first_entry(&mnt_ns->list, struct mount, mnt_list)->mnt_id;
 	list_for_each_entry(mnt, &mnt_ns->list, mnt_list) {
-		/* Don't reorder sus mount if not umounted */
+		// It is very important that we don't reorder the sus mount if it is not umounted
 		if (mnt->mnt_id == DEFAULT_KSU_MNT_ID) {
 			continue;
 		}

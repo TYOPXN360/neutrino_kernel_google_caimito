@@ -11,6 +11,7 @@
 #include <linux/slab.h>
 
 static char *saved_boot_config;
+
 #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
 extern int susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);
 #endif
