@@ -14,8 +14,6 @@
 
 /* LINK Registers */
 #define DWC3_LSKIPFREQ		0xd020
-
-#undef DWC3_LLUCTL
 #define DWC3_LLUCTL		0xd024
 
 /* Bit fields */
