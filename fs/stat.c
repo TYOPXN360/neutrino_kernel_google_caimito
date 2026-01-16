@@ -428,8 +428,14 @@ SYSCALL_DEFINE2(newlstat, const char __user *, filename,
 }
 
 #ifdef CONFIG_KSU_MANUAL_HOOK
+__attribute__((hot)) 
 extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
 				int *flags);
+
+extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
+#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
+extern void ksu_handle_fstat64_ret(unsigned int *fd, struct stat64 __user **statbuf_ptr); // optional
+#endif
 #endif
 
 #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
@@ -449,13 +455,6 @@ SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
 }
 #endif
 
-#ifdef CONFIG_KSU_MANUAL_HOOK
-extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
-#ifdef CONFIG_COMPAT
-extern void ksu_compat_newfstat_ret(unsigned int *fd, struct compat_stat __user **statbuf_ptr);
-#endif
-#endif
-
 SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
 {
 	struct kstat stat;
@@ -465,9 +464,8 @@ SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
 		error = cp_new_stat(&stat, statbuf);
 
 #ifdef CONFIG_KSU_MANUAL_HOOK
-  ksu_handle_newfstat_ret(&fd, &statbuf);
+	ksu_handle_newfstat_ret(&fd, &statbuf);
 #endif
-
 	return error;
 }
 #endif
@@ -595,6 +593,9 @@ SYSCALL_DEFINE2(fstat64, unsigned long, fd, struct stat64 __user *, statbuf)
 	if (!error)
 		error = cp_new_stat64(&stat, statbuf);
 
+#ifdef CONFIG_KSU_MANUAL_HOOK // for 32-bit
+	ksu_handle_fstat64_ret(&fd, &statbuf);
+#endif
 	return error;
 }
 
@@ -778,11 +779,6 @@ COMPAT_SYSCALL_DEFINE2(newfstat, unsigned int, fd,
 
 	if (!error)
 		error = cp_compat_stat(&stat, statbuf);
-		
-#ifdef CONFIG_KSU_MANUAL_HOOK // 32-on-64
-  ksu_compat_newfstat_ret(&fd, &statbuf);
-#endif		
-
 	return error;
 }
 #endif
