@@ -7,6 +7,9 @@
 #include <linux/slab.h>
 #include <linux/prefetch.h>
 #include "mount.h"
+#ifdef CONFIG_HYMOFS
+#include <linux/hymofs.h>
+#endif
 
 struct prepend_buffer {
 	char *buf;
@@ -234,6 +237,9 @@ char *d_absolute_path(const struct path *path,
 		return ERR_PTR(-EINVAL);
 	return extract_string(&b);
 }
+#ifdef CONFIG_HYMOFS
+EXPORT_SYMBOL(d_absolute_path);
+#endif
 
 static void get_fs_root_rcu(struct fs_struct *fs, struct path *root)
 {
@@ -289,8 +295,57 @@ char *d_path(const struct path *path, char *buf, int buflen)
 		prepend_char(&b, 0);
 	prepend_path(path, &root, &b);
 	rcu_read_unlock();
+#ifdef CONFIG_HYMOFS
+    {
+        char *res = extract_string(&b);
 
+        /* Fast exit if no rules - this also guards early boot */
+        if (!hymofs_enabled)
+            return res;
+
+        /* Safety check for early boot and atomic context */
+        if (!current->mm || in_interrupt() || irqs_disabled())
+            return res;
+        /* Allow hymod to see real paths for management */
+        if (strcmp(current->comm, "hymod") == 0)
+            return res;
+
+        if (!IS_ERR(res)) {
+            /* Use stack buffer for lookup path to avoid allocation if possible */
+            char temp_path[256];
+            char *lookup_path = res;
+            int len = strlen(res);
+            bool allocated = false;
+            
+            /* We need to copy res because we might overwrite it when writing to buf */
+            if (len < sizeof(temp_path)) {
+                memcpy(temp_path, res, len + 1);
+                lookup_path = temp_path;
+            } else {
+                lookup_path = kmalloc(len + 1, GFP_ATOMIC);
+                if (lookup_path) {
+                    memcpy(lookup_path, res, len + 1);
+                    allocated = true;
+                } else {
+                    return res; /* Can't allocate, just return original */
+                }
+            }
+            
+#ifdef CONFIG_HYMOFS_REVERSE_LOOKUP
+            /* Write directly to buf */
+            if (hymofs_reverse_lookup(lookup_path, buf, buflen) > 0) {
+                if (allocated) kfree(lookup_path);
+                return buf;
+            }
+#endif
+            
+            if (allocated) kfree(lookup_path);
+        }
+	    return res;
+    }
+#else
 	return extract_string(&b);
+#endif
 }
 EXPORT_SYMBOL(d_path);
 

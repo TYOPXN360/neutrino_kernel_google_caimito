@@ -25,6 +25,10 @@
 #include "internal.h"
 #include "mount.h"
 
+#ifdef CONFIG_HYMOFS
+#include <linux/hymofs.h>
+#endif
+
 /**
  * generic_fillattr - Fill in the basic attributes from the inode struct
  * @mnt_userns:	user namespace of the mount the inode was found from
@@ -120,11 +124,37 @@ int vfs_getattr_nosec(const struct path *path, struct kstat *stat,
 				  STATX_ATTR_DAX);
 
 	mnt_userns = mnt_user_ns(path->mnt);
+#ifdef CONFIG_HYMOFS
+	if (inode->i_op->getattr) {
+		int ret = inode->i_op->getattr(mnt_userns, path, stat,
+					    request_mask,
+					    query_flags);
+#ifdef CONFIG_HYMOFS_STAT_SPOOF
+        if (ret == 0) {
+            hymofs_spoof_stat(path, stat);
+            /* Apply full kstat spoofing if configured for this inode */
+            if (hymofs_is_kstat_spoofed(inode)) {
+                hymofs_spoof_kstat_by_ino(inode->i_ino, stat);
+            }
+        }
+#endif
+        return ret;
+    }
+#else
 	if (inode->i_op->getattr)
 		return inode->i_op->getattr(mnt_userns, path, stat,
 					    request_mask, query_flags);
+#endif
 
 	generic_fillattr(mnt_userns, inode, stat);
+#ifdef CONFIG_HYMOFS_STAT_SPOOF
+	/* HymoFS: Spoof timestamps if needed */
+	hymofs_spoof_stat(path, stat);
+	/* Apply full kstat spoofing if configured for this inode */
+	if (hymofs_is_kstat_spoofed(inode)) {
+		hymofs_spoof_kstat_by_ino(inode->i_ino, stat);
+	}
+#endif
 	return 0;
 }
 EXPORT_SYMBOL(vfs_getattr_nosec);
@@ -220,6 +250,9 @@ static int vfs_statx(int dfd, struct filename *filename, int flags,
 	struct path path;
 	unsigned int lookup_flags = getname_statx_lookup_flags(flags);
 	int error;
+#ifdef CONFIG_HYMOFS
+	struct filename *hymo_filename = NULL;
+#endif
 
 	if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH |
 		      AT_STATX_SYNC_TYPE))
@@ -227,6 +260,16 @@ static int vfs_statx(int dfd, struct filename *filename, int flags,
 
 retry:
 	error = filename_lookup(dfd, filename, lookup_flags, &path, NULL);
+
+#ifdef CONFIG_HYMOFS_FORWARD_REDIRECT
+	/* HymoFS: Handle merge directory - relative path + dirfd case */
+	if (error == -ENOENT && dfd >= 0 && filename->name[0] != '/') {
+		hymo_filename = hymofs_resolve_relative(dfd, filename->name);
+		if (hymo_filename)
+			error = filename_lookup(AT_FDCWD, hymo_filename, lookup_flags, &path, NULL);
+	}
+#endif
+
 	if (error)
 		goto out;
 
@@ -253,6 +296,10 @@ retry:
 		goto retry;
 	}
 out:
+#ifdef CONFIG_HYMOFS
+	if (hymo_filename)
+		putname(hymo_filename);
+#endif
 	return error;
 }
 

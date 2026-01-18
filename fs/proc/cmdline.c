@@ -3,9 +3,19 @@
 #include <linux/init.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#ifdef CONFIG_HYMOFS
+#include <linux/hymofs.h>
+#endif
 
 static int cmdline_proc_show(struct seq_file *m, void *v)
 {
+#ifdef CONFIG_HYMOFS_CMDLINE_SPOOF
+	/* HymoFS: try to spoof cmdline, returns 0 if spoofed */
+	if (hymofs_spoof_cmdline(m) == 0) {
+		seq_putc(m, '\n');
+		return 0;
+	}
+#endif
 	seq_puts(m, saved_command_line);
 	seq_putc(m, '\n');
 	return 0;
